@@ -297,7 +297,7 @@ if uploaded:
 
         st.divider()
 
-        if not api_key:
+        if not api_key or not api_key.startswith('AIza'):
             st.warning("⚠ أدخل Gemini API Key في الشريط الجانبي أولاً")
         else:
             projType = proj_type  # make accessible in function scope
