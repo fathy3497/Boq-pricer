@@ -3,6 +3,7 @@ import pandas as pd
 import openpyxl
 import json
 import io
+import requests
 from datetime import datetime
 import google.generativeai as genai
 
@@ -13,31 +14,33 @@ st.markdown("""
 .main-header { background: #1e3a5f; color: white; padding: 1.2rem 2rem; border-radius: 12px; margin-bottom: 1.5rem; }
 .main-header h1 { font-size: 24px; margin: 0; }
 .main-header p  { font-size: 13px; opacity: 0.75; margin: 4px 0 0; }
+.market-card { background: #f0fdf4; border: 1px solid #86efac; border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }
+.market-card h4 { color: #166534; font-size: 13px; margin-bottom: 8px; }
+.price-pill { display: inline-block; background: white; border: 1px solid #86efac; border-radius: 20px; padding: 3px 10px; font-size: 12px; margin: 3px; color: #166534; }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown("""
 <div class="main-header">
   <h1>📊 BOQ Auto Pricer</h1>
-  <p>ارفع أي ملف BOQ Excel — سعّره بالذكاء الاصطناعي — حمّل النتيجة</p>
+  <p>ارفع أي ملف BOQ Excel — أسعار السوق من KAPSARC — سعّر بالذكاء الاصطناعي</p>
 </div>
 """, unsafe_allow_html=True)
 
+# ── Sidebar ───────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ الإعدادات")
     api_key = st.text_input("🔑 Gemini API Key (مجاني)", type="password")
     st.caption("[احصل على مفتاح مجاني ←](https://aistudio.google.com/app/apikey)")
 
-    # Show available models when key is entered
     if api_key:
         try:
             genai.configure(api_key=api_key)
             available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-            # Pick best model automatically
             preferred = ['models/gemini-3.6-flash','models/gemini-2.0-flash','models/gemini-1.5-flash','models/gemini-pro']
             auto_model = next((m for m in preferred if m in available), available[0] if available else None)
             selected_model = st.selectbox("🤖 الموديل", available, index=available.index(auto_model) if auto_model in available else 0)
-            st.caption(f"✅ تم اكتشاف {len(available)} موديل")
+            st.caption(f"✅ {len(available)} موديل متاح")
         except Exception as e:
             st.error(f"خطأ في الـ API Key: {e}")
             selected_model = None
@@ -50,8 +53,62 @@ with st.sidebar:
     proj_type = st.selectbox("🏗 نوع المشروع", ["residential","commercial","mixed use","industrial","hospitality"])
     quality   = st.selectbox("⭐ مستوى الجودة", ["standard","high-end","luxury"], index=1)
     st.divider()
-    st.caption("v5.0 — BOQ Auto Pricer")
+    st.caption("v6.0 — BOQ Auto Pricer + KAPSARC")
 
+# ── Fetch market prices from KAPSARC ─────────────────────────────
+@st.cache_data(ttl=3600)  # cache for 1 hour
+def fetch_kapsarc_prices():
+    try:
+        url = "https://datasource.kapsarc.org/api/explore/v2.1/catalog/datasets/average-prices-of-some-construction-materials/records"
+        params = {"limit": 50, "order_by": "year desc"}
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            records = data.get("results", [])
+            prices = {}
+            for r in records:
+                material = str(r.get("goods") or r.get("material") or r.get("item") or "").strip()
+                price    = r.get("price") or r.get("value") or r.get("average_price")
+                unit     = r.get("unit") or ""
+                year     = r.get("year") or ""
+                if material and price:
+                    prices[material] = {"price": price, "unit": unit, "year": year}
+            return prices, None
+        return {}, f"HTTP {resp.status_code}"
+    except Exception as e:
+        return {}, str(e)
+
+@st.cache_data(ttl=3600)
+def fetch_gastat_cci():
+    try:
+        url = "https://datasource.kapsarc.org/api/explore/v2.1/catalog/datasets/construction-cost-indices-by-sector/records"
+        params = {"limit": 10, "order_by": "date desc"}
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            records = data.get("results", [])
+            if records:
+                latest = records[0]
+                return latest, None
+        return {}, f"HTTP {resp.status_code}"
+    except Exception as e:
+        return {}, str(e)
+
+def format_market_context(kapsarc_prices, cci_data):
+    """Build a context string for the AI from market data"""
+    lines = []
+    if kapsarc_prices:
+        lines.append("=== Saudi Arabia Market Prices (KAPSARC) ===")
+        for mat, info in list(kapsarc_prices.items())[:15]:
+            lines.append(f"- {mat}: {info['price']} SAR/{info['unit']} (Year: {info['year']})")
+    if cci_data:
+        lines.append("\n=== Construction Cost Index (GASTAT) ===")
+        for k, v in cci_data.items():
+            if v and k not in ['links', 'geo_point_2d']:
+                lines.append(f"- {k}: {v}")
+    return "\n".join(lines) if lines else ""
+
+# ── BOQ extractor ─────────────────────────────────────────────────
 def extract_items(file_bytes):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     all_items = []
@@ -104,7 +161,8 @@ def extract_items(file_bytes):
                               'unit':str(row['unit']).strip(),'qty':qty_f,'price':0.0,'total':0.0})
     return all_items
 
-def price_with_gemini(items, api_key, model_name, region, currency, proj_type, quality):
+# ── AI Pricing ────────────────────────────────────────────────────
+def price_with_gemini(items, api_key, model_name, region, currency, proj_type, quality, market_context=""):
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
 
@@ -122,9 +180,12 @@ def price_with_gemini(items, api_key, model_name, region, currency, proj_type, q
             f"{start+j}. {it['description']} (unit: {it['unit']}, qty: {it['qty']})"
             for j,it in enumerate(batch)
         )
+
+        market_section = f"\n\nREFERENCE MARKET DATA (use this to calibrate your prices):\n{market_context}" if market_context else ""
+
         prompt = f"""You are a senior quantity surveyor in {region}.
 Estimate realistic {quality} market unit prices in {currency} for a {proj_type} construction project in {region} (2025/2026).
-Include labor, materials, equipment, and contractor overhead.
+Include labor, materials, equipment, and contractor overhead.{market_section}
 
 Items:
 {numbered}
@@ -151,6 +212,7 @@ No markdown, no explanation."""
     status.success(f"✅ تم تسعير {priced} بند من أصل {len(items)}")
     return items
 
+# ── Export Excel ──────────────────────────────────────────────────
 def to_excel(items, currency):
     from openpyxl.styles import Font, PatternFill, Alignment
     wb = openpyxl.Workbook()
@@ -181,7 +243,34 @@ def to_excel(items, currency):
     buf=io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf
 
-# ── Main ─────────────────────────────────────────────────────────
+# ── Main UI ───────────────────────────────────────────────────────
+
+# Fetch market data automatically
+with st.spinner("🔄 جاري جلب أسعار السوق من KAPSARC..."):
+    kapsarc_prices, kapsarc_err = fetch_kapsarc_prices()
+    cci_data, cci_err = fetch_gastat_cci()
+
+# Show market prices panel
+if kapsarc_prices:
+    with st.expander("📈 أسعار السوق السعودي — KAPSARC (محدّثة تلقائياً)", expanded=False):
+        cols = st.columns(3)
+        for i, (mat, info) in enumerate(list(kapsarc_prices.items())[:12]):
+            cols[i%3].metric(
+                label=mat,
+                value=f"{info['price']:,.0f} SAR/{info['unit']}",
+                help=f"السنة: {info['year']}"
+            )
+        st.caption("المصدر: KAPSARC — مركز الملك عبدالله للدراسات البترولية والاقتصادية")
+else:
+    if kapsarc_err:
+        st.info(f"ℹ️ لم يتم جلب أسعار KAPSARC ({kapsarc_err}) — سيعتمد الـ AI على معلوماته الخاصة")
+
+# Build market context for AI
+market_context = format_market_context(kapsarc_prices, cci_data)
+
+st.divider()
+
+# File upload
 uploaded = st.file_uploader("📂 ارفع ملف BOQ", type=['xlsx','xls'], label_visibility='collapsed')
 
 if uploaded:
@@ -196,15 +285,21 @@ if uploaded:
         df_preview.columns=['رقم البند','الشيت','الوصف','الوحدة','الكمية']
         st.dataframe(df_preview,use_container_width=True,height=280)
         st.divider()
+
+        if market_context:
+            st.success("✅ الـ AI سيستخدم أسعار KAPSARC كمرجع للتسعير")
+        else:
+            st.info("ℹ️ الـ AI سيعتمد على معلوماته الخاصة عن السوق")
+
         if not api_key:
             st.warning("⚠ أدخل Gemini API Key في الشريط الجانبي أولاً")
         elif not selected_model:
             st.warning("⚠ تأكد من صحة الـ API Key")
         else:
             if st.button("✨ ابدأ التسعير التلقائي", use_container_width=True):
-                items=price_with_gemini(items,api_key,selected_model,region,currency,proj_type,quality)
-                st.session_state['priced_items']=items
-                st.session_state['currency']=currency
+                items = price_with_gemini(items, api_key, selected_model, region, currency, proj_type, quality, market_context)
+                st.session_state['priced_items'] = items
+                st.session_state['currency'] = currency
 
 if 'priced_items' in st.session_state:
     items=st.session_state['priced_items']
@@ -219,8 +314,9 @@ if 'priced_items' in st.session_state:
     df=pd.DataFrame(items)[['item_no','description','unit','qty','price','total']]
     df.columns=['رقم البند','الوصف','الوحدة','الكمية','سعر الوحدة','الإجمالي']
     st.data_editor(df,use_container_width=True,height=400,
-        column_config={'سعر الوحدة':st.column_config.NumberColumn(format=f"%.2f {currency}",min_value=0),
-                       'الإجمالي':st.column_config.NumberColumn(format=f"%.2f {currency}",disabled=True)},
+        column_config={
+            'سعر الوحدة':st.column_config.NumberColumn(format=f"%.2f {currency}",min_value=0),
+            'الإجمالي':st.column_config.NumberColumn(format=f"%.2f {currency}",disabled=True)},
         disabled=['رقم البند','الوصف','الوحدة','الكمية','الإجمالي'])
     excel_buf=to_excel(items,currency)
     st.download_button(label="📥 تحميل Excel",data=excel_buf,
