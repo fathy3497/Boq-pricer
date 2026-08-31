@@ -88,7 +88,7 @@ def price_with_gemini(items, api_key, region, currency, proj_type, quality):
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.0-flash')
         use_sdk = True
     except Exception as e:
         st.warning(f"SDK error: {e} — سيتم المحاولة بطريقة أخرى")
